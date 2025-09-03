@@ -1,8 +1,8 @@
 import re
 import folder_paths
 import numpy as np
-import json
 import os.path
+import json, os, math, io, random, struct
 
 from copy import deepcopy
 from PIL import Image, ImageDraw, ImageFont
@@ -17,7 +17,7 @@ try:
 except Exception:
     piexif = None
 
-import json, os, math, io, random, struct, zlib, base64
+
 
 static_x = 1
 static_y = 1
@@ -569,17 +569,17 @@ class SaveImageGrid:
                 else:
                     raise
 
-            # Always embed the full metadata inside JPEG using COM segments (unlimited).
-            # We store a compressed JSON payload labeled with COMFYMDv1 across multiple segments.
+            # Always embed the full metadata inside JPEG using COM segments (readable text).
+            # We store UTF-8 JSON across multiple COM segments labeled COMFYMDv1 utf8.
             if not args.disable_metadata and (prompt is not None or extra_pnginfo is not None):
                 try:
                     payload = {"prompt": prompt}
                     if isinstance(extra_pnginfo, dict):
                         for k, v in extra_pnginfo.items():
                             payload[k] = v
-                    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    comp = zlib.compress(raw, level=6)
-                    self._jpeg_insert_com_segments(out_path, label="comfy", data=comp, chunk_size=60000)
+                    text = json.dumps(payload, ensure_ascii=False)
+                    self._jpeg_insert_com_segments_text(out_path, label="comfy", text=text, chunk_size=60000)
+
                 except Exception:
                     # Non-fatal; image already saved
                     pass
@@ -612,11 +612,11 @@ class SaveImageGrid:
         self.done_flag = False
 
     @staticmethod
-    def _jpeg_insert_com_segments(jpeg_path: str, label: str, data: bytes, chunk_size: int = 60000) -> None:
+    def _jpeg_insert_com_segments_text(jpeg_path: str, label: str, text: str, chunk_size: int = 60000) -> None:
         """
-        Insert one or more JPEG COM segments carrying Base64-encoded, zlib-compressed metadata.
-        Segment format:
-          "COMFYMDv1 {label} {idx}/{total}\\n" + base64_chunk
+        Insert one or more JPEG COM segments carrying plain UTF-8 JSON metadata.
+        Segment format (human readable in exiftool):
+          "COMFYMDv1 utf8 {label} {idx}/{total}\n" + json_chunk
         """
         with open(jpeg_path, "rb") as f:
             buf = f.read()
@@ -642,13 +642,13 @@ class SaveImageGrid:
             i += seglen
             insert_at = i  # keep sliding until SOS
 
-        # Prepare chunks
-        b64 = base64.b64encode(data)
-        total = (len(b64) + chunk_size - 1) // chunk_size if len(b64) else 1
+        # Prepare chunks (UTF-8 bytes of JSON)
+        raw = text.encode("utf-8")
+        total = (len(raw) + chunk_size - 1) // chunk_size if len(raw) else 1
         segments = []
         for idx in range(total):
-            chunk = b64[idx * chunk_size:(idx + 1) * chunk_size]
-            header = f"COMFYMDv1 {label} {idx + 1}/{total}\n".encode("ascii")
+            chunk = raw[idx * chunk_size:(idx + 1) * chunk_size]
+            header = f"COMFYMDv1 utf8 {label} {idx + 1}/{total}\n".encode("ascii")
             payload = header + chunk
             seg = b"\xFF\xFE" + struct.pack(">H", len(payload) + 2) + payload
             segments.append(seg)
