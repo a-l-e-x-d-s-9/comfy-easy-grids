@@ -390,11 +390,16 @@ class SaveImageGrid:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": 
-                    {"images": ("IMAGE", ),
+        return {"required":
+                    {"images": ("IMAGE",),
                      "x_size": ("INT", {"default": 1, "min": 1, "step": 1}),
                      "y_size": ("INT", {"default": 1, "min": 1, "step": 1}),
-                     "filename_prefix": ("STRING", {"default": "ComfyUI"})},
+                     "filename_prefix": ("STRING", {"default": "ComfyUI"}),
+                     # New save options
+                     "file_format": (["PNG", "WEBP", "JPEG"], {"default": "WEBP"}),
+                     "quality": ("INT", {"default": 92, "min": 1, "max": 100}),
+                     "webp_lossless": ("BOOLEAN", {"default": False}),
+                     "optimize": ("BOOLEAN", {"default": True})},
                 "optional" : { "column_labels": ("STRING_LIST", {"default": None}),
                                "row_labels": ("STRING_LIST", {"default": None }),
                                "images_grid_annotation": ("GRID_ANNOTATION",)}, 
@@ -406,9 +411,10 @@ class SaveImageGrid:
 
     OUTPUT_NODE = True
 
-    CATEGORY = "EasyGrids"
-
-    def accumulate_images(self, images, x_size, y_size, filename_prefix="ComfyUI", prompt=None, extra_pnginfo=None, column_labels=None, row_labels=None, images_grid_annotation=None, unique_id=None):
+    def accumulate_images(self, images, x_size, y_size, filename_prefix="ComfyUI",
+                          file_format="WEBP", quality=92, webp_lossless=False, optimize=True,
+                          prompt=None, extra_pnginfo=None,
+                          column_labels=None, row_labels=None, images_grid_annotation=None, unique_id=None):
         if unique_id is not None:
             if unique_id != self.unique_id:
                 if self.unique_id is not None and self is reset_registry.get(self.unique_id, None):
@@ -429,13 +435,15 @@ class SaveImageGrid:
                 self.curr_x_idx = 0
         
                 
-        if len( self.image_grid ) >= self.curr_x_size * self.curr_y_size:
+        if len(self.image_grid) >= self.curr_x_size * self.curr_y_size:
             #complete grid
             if images_grid_annotation is not None:
                 column_labels = images_grid_annotation.column_texts
                 row_labels = images_grid_annotation.row_texts
             grid_image = self.assemble_grid( column_labels, row_labels )
-            return self.save_grid( grid_image, filename_prefix, prompt, extra_pnginfo )
+            return self.save_grid(grid_image, filename_prefix,
+                                  file_format=file_format, quality=quality, webp_lossless=webp_lossless, optimize=optimize,
+                                  prompt=prompt, extra_pnginfo=extra_pnginfo)
         return { "ui": { "images": [] } }
     
     def assemble_grid( self, column_labels : list[str] | None = None, row_labels : list[str] | None = None ) -> Image:
@@ -454,38 +462,70 @@ class SaveImageGrid:
             width_padding = int(max( [ label_font.getlength( text ) for text in row_labels ] ) * 1.5)
         total_width += width_padding
         total_height += height_padding
-        with Image.new("RGB", (total_width, total_height), color="#ffffff") as grid_canvas:
-            draw = ImageDraw.Draw( grid_canvas )
-            for y_idx in range( self.curr_y_size ):
-                if row_labels is not None and y_idx < len( row_labels ):
-                    row_x_anchor = width_padding / 2
-                    row_y_anchor = height_padding + space_height * y_idx + ( space_height / 2 )
-                    draw.text((row_x_anchor, row_y_anchor), row_labels[y_idx], anchor="mm", font=label_font, fill="#000000")
-                for x_idx in range( self.curr_x_size ):
-                    if y_idx == 0:
-                        if column_labels is not None and x_idx < len( column_labels ):
-                            col_x_anchor = width_padding + space_width * x_idx + ( space_width / 2 )
-                            col_y_anchor = height_padding / 2
-                            draw.text((col_x_anchor, col_y_anchor), column_labels[x_idx], anchor="mm", font=label_font, fill="#000000")
-                    pil_image = Image.fromarray( np.clip( ( self.image_grid[ ( y_idx * self.curr_x_size ) + x_idx].cpu().numpy() * 255. ), 0, 255 ).astype( np.uint8 ) )
-                    grid_canvas.paste(pil_image, ((x_idx * space_width) + width_padding, (y_idx * space_height) + height_padding ))
-            return grid_canvas
+        grid_canvas = Image.new("RGB", (total_width, total_height), color="#ffffff")
+        draw = ImageDraw.Draw(grid_canvas)
+        for y_idx in range(self.curr_y_size):
+            if row_labels is not None and y_idx < len(row_labels):
+                row_x_anchor = width_padding / 2
+                row_y_anchor = height_padding + space_height * y_idx + (space_height / 2)
+                draw.text((row_x_anchor, row_y_anchor), row_labels[y_idx], anchor="mm", font=label_font, fill="#000000")
+            for x_idx in range(self.curr_x_size):
+                if y_idx == 0 and column_labels is not None and x_idx < len(column_labels):
+                    col_x_anchor = width_padding + space_width * x_idx + (space_width / 2)
+                    col_y_anchor = height_padding / 2
+                    draw.text((col_x_anchor, col_y_anchor), column_labels[x_idx], anchor="mm", font=label_font, fill="#000000")
+                pil_image = Image.fromarray(np.clip((self.image_grid[(y_idx * self.curr_x_size) + x_idx].cpu().numpy() * 255.), 0, 255).astype(np.uint8))
+                grid_canvas.paste(pil_image, ((x_idx * space_width) + width_padding, (y_idx * space_height) + height_padding))
+        return grid_canvas
 
-
-    def save_grid( self, grid_image, filename_prefix, prompt=None, extra_pnginfo=None ):
+    def save_grid(self, grid_image, filename_prefix,
+                  file_format="WEBP", quality=92, webp_lossless=False, optimize=True,
+                  prompt=None, extra_pnginfo=None):
         full_output_folder, filename, counter, subfolder, filename_prefix = folder_paths.get_save_image_path(filename_prefix, self.output_dir, grid_image.width, grid_image.height)
         results = list()
-        metadata = None
-        if not args.disable_metadata:
-            metadata = PngInfo()
+
+        fmt = str(file_format).upper() if file_format is not None else "PNG"
+        if fmt not in ("PNG", "WEBP", "JPEG"):
+            fmt = "PNG"
+        ext = "png" if fmt == "PNG" else ("webp" if fmt == "WEBP" else "jpg")
+
+        # Prepare PNG metadata if enabled
+        png_metadata = None
+        if fmt == "PNG" and not args.disable_metadata:
+            png_metadata = PngInfo()
             if prompt is not None:
-                metadata.add_text("prompt", json.dumps(prompt))
+                png_metadata.add_text("prompt", json.dumps(prompt))
             if extra_pnginfo is not None:
                 for x in extra_pnginfo:
-                    metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+                    png_metadata.add_text(x, json.dumps(extra_pnginfo[x]))
 
-        file = f"{filename}_{counter:05}_.png"
-        grid_image.save(os.path.join(full_output_folder, file), pnginfo=metadata, compress_level=4)
+        file = f"{filename}_{counter:05}_.{ext}"
+        out_path = os.path.join(full_output_folder, file)
+
+        if fmt == "PNG":
+            grid_image.save(out_path, pnginfo=png_metadata, compress_level=4)
+        elif fmt == "WEBP":
+            # grid is RGB already; WEBP supports quality/lossless
+            grid_image.save(out_path, format="WEBP", quality=int(quality), lossless=bool(webp_lossless), method=6)
+        else:
+            # JPEG must be 3-channel, no alpha; optional optimize/progressive
+            if grid_image.mode not in ("RGB", "L"):
+                grid_image = grid_image.convert("RGB")
+            grid_image.save(out_path, format="JPEG", quality=int(quality), optimize=bool(optimize), progressive=True, subsampling=1)
+
+        # For non-PNG formats, optionally write a small JSON sidecar to preserve prompt/extra info
+        if fmt != "PNG" and not args.disable_metadata and (prompt is not None or extra_pnginfo is not None):
+            sidecar = {
+                "prompt": prompt if prompt is not None else None,
+                "extra_pnginfo": extra_pnginfo if extra_pnginfo is not None else None
+            }
+            try:
+                with open(os.path.join(full_output_folder, f"{filename}_{counter:05}_.json"), "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f, ensure_ascii=False, indent=2)
+            except Exception:
+                # Non-fatal: image already saved
+                pass
+
         results.append({
             "filename": file,
             "subfolder": subfolder,
