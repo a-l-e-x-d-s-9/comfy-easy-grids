@@ -11,6 +11,11 @@ from comfy.utils import load_torch_file
 from comfy.sd import load_lora_for_models
 from PIL.PngImagePlugin import PngInfo
 from .grid_types import Annotation
+# Optional EXIF writer (JPEG/WEBP)
+try:
+    import piexif, piexif.helper
+except Exception:
+    piexif = None
 
 static_x = 1
 static_y = 1
@@ -445,8 +450,8 @@ class SaveImageGrid:
                                   file_format=file_format, quality=quality, webp_lossless=webp_lossless, optimize=optimize,
                                   prompt=prompt, extra_pnginfo=extra_pnginfo)
         return { "ui": { "images": [] } }
-    
-    def assemble_grid( self, column_labels : list[str] | None = None, row_labels : list[str] | None = None ) -> Image:
+
+    def assemble_grid(self, column_labels: list[str] | None = None, row_labels: list[str] | None = None) -> Image:
         space_height = max( [ len(image) for image in self.image_grid ] )
         space_width = max( [ len(image[0]) for image in self.image_grid ] )
         total_width = space_width * self.curr_x_size
@@ -461,6 +466,7 @@ class SaveImageGrid:
         if row_labels is not None and len(row_labels) > 0:
             width_padding = int(max( [ label_font.getlength( text ) for text in row_labels ] ) * 1.5)
         total_width += width_padding
+
         total_height += height_padding
         grid_canvas = Image.new("RGB", (total_width, total_height), color="#ffffff")
         draw = ImageDraw.Draw(grid_canvas)
@@ -489,31 +495,76 @@ class SaveImageGrid:
             fmt = "PNG"
         ext = "png" if fmt == "PNG" else ("webp" if fmt == "WEBP" else "jpg")
 
+        # Always compute output paths and prepare EXIF holder
+        file = f"{filename}_{counter:05}_.{ext}"
+        out_path = os.path.join(full_output_folder, file)
+        exif_bytes = None
+
         # Prepare PNG metadata if enabled
         png_metadata = None
         if fmt == "PNG" and not args.disable_metadata:
             png_metadata = PngInfo()
             if prompt is not None:
                 png_metadata.add_text("prompt", json.dumps(prompt))
-            if extra_pnginfo is not None:
-                for x in extra_pnginfo:
-                    png_metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+            if isinstance(extra_pnginfo, dict):
+                for k, v in extra_pnginfo.items():
+                    png_metadata.add_text(k, json.dumps(v))
 
-        file = f"{filename}_{counter:05}_.{ext}"
-        out_path = os.path.join(full_output_folder, file)
+        # Build EXIF (UserComment) JSON payload for WEBP/JPEG
+        # Stored in EXIF tag 0x9286 (UserComment). If Pillow drops it, we try piexif.insert().
+        if fmt in ("WEBP", "JPEG") and not args.disable_metadata and piexif is not None:
+            try:
+                payload = {}
+                if prompt is not None:
+                    payload["prompt"] = prompt
+                if isinstance(extra_pnginfo, dict):
+                    if "workflow" in extra_pnginfo:
+                        payload["workflow"] = extra_pnginfo.get("workflow")
+                    # carry any other fields too
+                    for k, v in extra_pnginfo.items():
+                        if k != "workflow":
+                            payload[k] = v
+                user_comment = json.dumps(payload, ensure_ascii=False)
+                exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+                exif_dict["0th"][piexif.ImageIFD.Software] = "ComfyUI Save Image Grid"
+                exif_dict["Exif"][piexif.ExifIFD.UserComment] = piexif.helper.UserComment.dump(
+                    user_comment, encoding="unicode"
+                )
+                exif_bytes = piexif.dump(exif_dict)
+            except Exception:
+                exif_bytes = None
+
+
 
         if fmt == "PNG":
             grid_image.save(out_path, pnginfo=png_metadata, compress_level=4)
         elif fmt == "WEBP":
             # grid is RGB already; WEBP supports quality/lossless
-            grid_image.save(out_path, format="WEBP", quality=int(quality), lossless=bool(webp_lossless), method=6)
+            save_kwargs = {"format": "WEBP", "quality": int(quality), "lossless": bool(webp_lossless), "method": 6}
+            if exif_bytes is not None:
+                save_kwargs["exif"] = exif_bytes
+            grid_image.save(out_path, **save_kwargs)
+            # If Pillow dropped EXIF for WEBP, try forced insert
+            if exif_bytes is not None and piexif is not None:
+                try:
+                    piexif.insert(exif_bytes, out_path)
+                except Exception:
+                    pass
         else:
             # JPEG must be 3-channel, no alpha; optional optimize/progressive
             if grid_image.mode not in ("RGB", "L"):
                 grid_image = grid_image.convert("RGB")
-            grid_image.save(out_path, format="JPEG", quality=int(quality), optimize=bool(optimize), progressive=True, subsampling=1)
+            save_kwargs = {"format": "JPEG", "quality": int(quality), "optimize": bool(optimize), "progressive": True, "subsampling": 1}
+            if exif_bytes is not None:
+                save_kwargs["exif"] = exif_bytes
+            grid_image.save(out_path, **save_kwargs)
+            if exif_bytes is not None and piexif is not None:
+                try:
+                    piexif.insert(exif_bytes, out_path)
+                except Exception:
+                    pass
 
-        # For non-PNG formats, optionally write a small JSON sidecar to preserve prompt/extra info
+        # Keep sidecar for maximum compatibility (apps may strip EXIF on share)
         if fmt != "PNG" and not args.disable_metadata and (prompt is not None or extra_pnginfo is not None):
             sidecar = {
                 "prompt": prompt if prompt is not None else None,
