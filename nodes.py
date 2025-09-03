@@ -17,6 +17,8 @@ try:
 except Exception:
     piexif = None
 
+import json, os, math, io, random, struct, zlib, base64
+
 static_x = 1
 static_y = 1
 
@@ -557,11 +559,29 @@ class SaveImageGrid:
             save_kwargs = {"format": "JPEG", "quality": int(quality), "optimize": bool(optimize), "progressive": True, "subsampling": 1}
             if exif_bytes is not None:
                 save_kwargs["exif"] = exif_bytes
-            grid_image.save(out_path, **save_kwargs)
-            if exif_bytes is not None and piexif is not None:
+            try:
+                grid_image.save(out_path, **save_kwargs)
+            except ValueError as e:
+                # Typical Pillow error: ValueError("EXIF data is too long")
+                if "EXIF data is too long" in str(e):
+                    save_kwargs.pop("exif", None)
+                    grid_image.save(out_path, **save_kwargs)
+                else:
+                    raise
+
+            # Always embed the full metadata inside JPEG using COM segments (unlimited).
+            # We store a compressed JSON payload labeled with COMFYMDv1 across multiple segments.
+            if not args.disable_metadata and (prompt is not None or extra_pnginfo is not None):
                 try:
-                    piexif.insert(exif_bytes, out_path)
+                    payload = {"prompt": prompt}
+                    if isinstance(extra_pnginfo, dict):
+                        for k, v in extra_pnginfo.items():
+                            payload[k] = v
+                    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    comp = zlib.compress(raw, level=6)
+                    self._jpeg_insert_com_segments(out_path, label="comfy", data=comp, chunk_size=60000)
                 except Exception:
+                    # Non-fatal; image already saved
                     pass
 
         # Keep sidecar for maximum compatibility (apps may strip EXIF on share)
@@ -590,6 +610,52 @@ class SaveImageGrid:
         self.curr_y_idx = 0
         self.image_grid = []
         self.done_flag = False
+
+    @staticmethod
+    def _jpeg_insert_com_segments(jpeg_path: str, label: str, data: bytes, chunk_size: int = 60000) -> None:
+        """
+        Insert one or more JPEG COM segments carrying Base64-encoded, zlib-compressed metadata.
+        Segment format:
+          "COMFYMDv1 {label} {idx}/{total}\\n" + base64_chunk
+        """
+        with open(jpeg_path, "rb") as f:
+            buf = f.read()
+        if len(buf) < 4 or buf[0:2] != b"\xFF\xD8":
+            return  # not a JPEG
+
+        # Find insertion point before SOS (0xFFDA)
+        i = 2
+        insert_at = 2
+        n = len(buf)
+        while i + 4 <= n and buf[i] == 0xFF:
+            marker = buf[i + 1]
+            i += 2
+            # Standalone markers are not expected in header; treat as abnormal and stop
+            if marker == 0xDA:  # SOS - start of scan
+                insert_at = i - 2
+                break
+            if i + 2 > n:
+                break
+            seglen = struct.unpack(">H", buf[i:i + 2])[0]
+            if seglen < 2 or i + seglen > n:
+                break
+            i += seglen
+            insert_at = i  # keep sliding until SOS
+
+        # Prepare chunks
+        b64 = base64.b64encode(data)
+        total = (len(b64) + chunk_size - 1) // chunk_size if len(b64) else 1
+        segments = []
+        for idx in range(total):
+            chunk = b64[idx * chunk_size:(idx + 1) * chunk_size]
+            header = f"COMFYMDv1 {label} {idx + 1}/{total}\n".encode("ascii")
+            payload = header + chunk
+            seg = b"\xFF\xFE" + struct.pack(">H", len(payload) + 2) + payload
+            segments.append(seg)
+
+        patched = buf[:insert_at] + b"".join(segments) + buf[insert_at:]
+        with open(jpeg_path, "wb") as f:
+            f.write(patched)
 
 
 NODE_CLASS_MAPPINGS = {
